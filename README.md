@@ -1,15 +1,8 @@
 # TTS Comparison Project - Implementation Summary
-
+# made by arnav c
 ## Overview
 
-Successfully implemented 4 major enhancements to the TTS comparison project:
 
-1. ✅ Added MeloTTS model integration
-2. ✅ Migrated VibeVoice from 1.5B to 0.5B Realtime streaming model
-3. ✅ Added cross-platform DirectML support for AMD GPUs
-4. ✅ Simplified comparison workflow to generate one audio file per model
-
-## Files Modified/Created
 
 ### 1. **testmodels/test_melotts.py** (NEW FILE)
 - Complete MeloTTS wrapper following established patterns
