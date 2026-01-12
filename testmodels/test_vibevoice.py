@@ -283,19 +283,25 @@ class VibeVoiceRealtimeTTS:
 
         # Prepare inputs with cached voice prompt
         inputs = self.processor.process_input_with_cached_prompt(
-            text,
-            cached_prompt=self.voice_preset
+            text=text,
+            cached_prompt=self.voice_preset,
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True
         )
 
         # Move inputs to device
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                   for k, v in inputs.items()}
 
-        # Generate
+        # Generate - Critical: pass tokenizer to avoid NoneType error
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
+                max_new_tokens=None,
                 cfg_scale=cfg_scale,
+                tokenizer=self.processor.tokenizer,
+                generation_config={'do_sample': False},
                 all_prefilled_outputs=copy.deepcopy(self.voice_preset)
             )
 
