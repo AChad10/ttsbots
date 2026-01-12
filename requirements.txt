@@ -31,3 +31,6 @@ chatterbox-tts
 huggingface-hub
 accelerate
 safetensors
+
+# For OpenFace cheating detection
+pandas>=1.3.0
