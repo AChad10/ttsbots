@@ -16,10 +16,17 @@ sentencepiece
 chatterbox-tts
 
 # For MeloTTS - Install from source
-# git clone https://github.com/myshell-ai/MeloTTS.git
-# cd MeloTTS
-# pip install -e .
-# python -m unidic download
+# WINDOWS USERS: See WINDOWS_INSTALL.md for build dependency solutions
+#
+# Pre-install build dependencies (avoids compilation issues):
+#   pip install --upgrade pip setuptools wheel
+#   pip install tokenizers fugashi[unidic-lite]
+#
+# Then install MeloTTS:
+#   git clone https://github.com/myshell-ai/MeloTTS.git
+#   cd MeloTTS
+#   pip install -e .
+#   python -m unidic download
 
 # For VibeVoice Realtime 0.5B - Install from source
 # git clone https://github.com/vibevoice-community/VibeVoice.git
