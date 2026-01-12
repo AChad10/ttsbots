@@ -1,7 +1,7 @@
 # Core dependencies for TTS model comparison
 torch>=2.1.0
 torchaudio>=2.1.0
-numpy
+numpy>=1.26.0  # Required for Python 3.12+ compatibility
 scipy
 soundfile
 
@@ -12,8 +12,9 @@ torch-directml
 transformers>=4.40.0
 sentencepiece
 
-# For Chatterbox
-chatterbox-tts
+# For Chatterbox - pin to avoid dependency backtracking
+chatterbox-tts>=0.1.3
+librosa>=0.10.0  # Explicit dependency to help resolver
 
 # For MeloTTS - Install from source
 # git clone https://github.com/myshell-ai/MeloTTS.git
