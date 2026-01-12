@@ -758,7 +758,41 @@ class WebcamProcessor:
 
     Supports two modes:
     1. With OpenFace binary: Full gaze tracking via OpenFace subprocess
-    2. Simulation mode: Uses face detection for demo when OpenFace unavailable
+    2. Simulation mode: Uses face + eye detection for demo when OpenFace unavailable
+
+    DETECTION LOGIC EXPLAINED:
+    ==========================
+
+    The system analyzes gaze direction and head pose to classify behavior:
+
+    1. NORMAL: Looking at screen/camera
+       - Gaze angle near center (within ~10 degrees horizontal)
+       - Head facing forward
+       - This is the baseline state
+
+    2. THINKING: Looking away to recall/process information
+       - Gaze tends UPWARD (looking up to recall memories - proven cognitive behavior)
+       - OR gaze WANDERS in multiple directions (processing information)
+       - High gaze variability over time window
+       - May show concentration facial expressions (brow furrow)
+
+    3. SUSPICIOUS: Possible cheating indicator
+       - Moderate horizontal gaze to one side (10-20 degrees)
+       - Head slightly turned
+       - Brief duration (2-4 seconds)
+
+    4. CHEATING: Strong cheating indicator
+       - SUSTAINED horizontal gaze to one side (>20 degrees)
+       - Head turned AND fixed in reading position
+       - LOW gaze variability (stable reading pattern)
+       - Gaze and head aligned (both pointing same direction)
+       - Duration > 4 seconds
+
+    Key Metrics:
+    - gaze_angle_x: Horizontal gaze direction (negative=left, positive=right)
+    - gaze_angle_y: Vertical gaze direction (negative=down, positive=up)
+    - pose_Ry: Head yaw (rotation left/right)
+    - gaze_variability: How much gaze moves over time window
     """
 
     # Colors for visualization (BGR format)
@@ -780,11 +814,13 @@ class WebcamProcessor:
         self,
         detector: OpenFaceCheatingDetector,
         camera_id: int = 0,
-        show_visualization: bool = True
+        show_visualization: bool = True,
+        glasses_mode: bool = False
     ):
         self.detector = detector
         self.camera_id = camera_id
         self.show_visualization = show_visualization
+        self.glasses_mode = glasses_mode
 
         self.running = False
         self.current_behavior = GazeBehavior.NORMAL
@@ -809,7 +845,28 @@ class WebcamProcessor:
 
         # Face detection fallback (when OpenFace unavailable)
         self.face_cascade = None
+        self.eye_cascade = None
         self.use_simulation = False
+
+        # Calibration - store baseline face/eye position
+        self.calibration_frames = []
+        self.baseline_face_center = None
+        self.baseline_eye_positions = None
+        self.is_calibrated = False
+
+        # Tracking history for better detection
+        self.gaze_history = deque(maxlen=30)  # 1 second of gaze data
+        self.head_pose_history = deque(maxlen=30)
+
+        # Debug info for display
+        self.debug_info = {
+            'gaze_x': 0.0,
+            'gaze_y': 0.0,
+            'head_yaw': 0.0,
+            'variability': 0.0,
+            'confidence': 0.0,
+            'eyes_detected': False,
+        }
 
     def _find_openface_live(self) -> Optional[str]:
         """Find OpenFace binary for live video processing."""
@@ -836,11 +893,19 @@ class WebcamProcessor:
         openface_path = self._find_openface_live()
 
         if not openface_path:
-            print("OpenFace not found - running in simulation mode")
-            print("For full gaze tracking, install OpenFace from:")
+            print("OpenFace not found - running in SIMULATION mode")
+            print("(Uses face/eye detection as proxy for gaze)")
+            print("\nFor full accuracy, install OpenFace from:")
             print("https://github.com/TadasBaltrusaitis/OpenFace")
+            print("\n" + "=" * 50)
+            print("SIMULATION MODE INSTRUCTIONS:")
+            print("- Move your HEAD to simulate gaze direction")
+            print("- Look LEFT/RIGHT: Turn head sideways")
+            print("- Look UP: Tilt head up (triggers THINKING)")
+            print("- Stay centered: Face camera directly (NORMAL)")
+            print("=" * 50 + "\n")
             self.use_simulation = True
-            self._init_face_cascade()
+            self._init_cascades()
             return
 
         output_dir = tempfile.mkdtemp(prefix="openface_live_")
@@ -878,19 +943,30 @@ class WebcamProcessor:
             print(f"Failed to start OpenFace: {e}")
             print("Running in simulation mode")
             self.use_simulation = True
-            self._init_face_cascade()
+            self._init_cascades()
 
-    def _init_face_cascade(self):
-        """Initialize OpenCV face cascade for simulation mode."""
-        cascade_paths = [
+    def _init_cascades(self):
+        """Initialize OpenCV cascades for simulation mode."""
+        # Face cascade
+        face_cascade_paths = [
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
             '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
             '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
         ]
-
-        for path in cascade_paths:
+        for path in face_cascade_paths:
             if os.path.exists(path):
                 self.face_cascade = cv2.CascadeClassifier(path)
+                break
+
+        # Eye cascade for better tracking
+        eye_cascade_paths = [
+            cv2.data.haarcascades + 'haarcascade_eye.xml',
+            cv2.data.haarcascades + 'haarcascade_eye_tree_eyeglasses.xml',
+            '/usr/share/opencv4/haarcascades/haarcascade_eye.xml',
+        ]
+        for path in eye_cascade_paths:
+            if os.path.exists(path):
+                self.eye_cascade = cv2.CascadeClassifier(path)
                 break
 
     def _read_openface_output(self, output_dir: str):
@@ -961,41 +1037,192 @@ class WebcamProcessor:
                         with self.data_lock:
                             self.latest_openface_data = frame_data
 
-                    except (ValueError, KeyError) as e:
+                    except (ValueError, KeyError):
                         continue
 
                 time.sleep(0.01)  # Small delay
 
-            except Exception as e:
+            except Exception:
                 time.sleep(0.1)
 
-    def _simulate_gaze_from_face(self, frame, faces) -> Optional[dict]:
-        """
-        Simulate gaze data from face detection for demo mode.
+    def _detect_eyes_in_face(self, gray, face_roi, face_x, face_y):
+        """Detect eyes within face region and return their positions."""
+        if self.eye_cascade is None:
+            return None, None
 
-        Uses face position relative to frame center as a proxy for gaze.
+        eyes = self.eye_cascade.detectMultiScale(
+            face_roi,
+            scaleFactor=1.1,
+            minNeighbors=3,
+            minSize=(20, 20),
+            maxSize=(80, 80)
+        )
+
+        if len(eyes) < 2:
+            return None, None
+
+        # Sort by x position to get left and right eye
+        eyes = sorted(eyes, key=lambda e: e[0])
+        left_eye = eyes[0]
+        right_eye = eyes[-1]
+
+        # Calculate eye centers relative to full frame
+        left_center = (
+            face_x + left_eye[0] + left_eye[2] // 2,
+            face_y + left_eye[1] + left_eye[3] // 2
+        )
+        right_center = (
+            face_x + right_eye[0] + right_eye[2] // 2,
+            face_y + right_eye[1] + right_eye[3] // 2
+        )
+
+        return left_center, right_center
+
+    def _calibrate(self, frame, face, gray):
+        """Calibrate baseline position from first few frames."""
+        x, y, w, h = face
+        face_center = (x + w // 2, y + h // 2)
+
+        # Get eye positions
+        face_roi = gray[y:y+h, x:x+w]
+        left_eye, right_eye = self._detect_eyes_in_face(gray, face_roi, x, y)
+
+        self.calibration_frames.append({
+            'face_center': face_center,
+            'left_eye': left_eye,
+            'right_eye': right_eye
+        })
+
+        # Need 15 frames to calibrate
+        if len(self.calibration_frames) >= 15:
+            # Average the positions
+            valid_frames = [f for f in self.calibration_frames
+                          if f['left_eye'] is not None]
+
+            if valid_frames:
+                self.baseline_face_center = (
+                    np.mean([f['face_center'][0] for f in self.calibration_frames]),
+                    np.mean([f['face_center'][1] for f in self.calibration_frames])
+                )
+                self.baseline_eye_positions = {
+                    'left': (
+                        np.mean([f['left_eye'][0] for f in valid_frames]),
+                        np.mean([f['left_eye'][1] for f in valid_frames])
+                    ),
+                    'right': (
+                        np.mean([f['right_eye'][0] for f in valid_frames]),
+                        np.mean([f['right_eye'][1] for f in valid_frames])
+                    )
+                }
+            else:
+                self.baseline_face_center = (
+                    np.mean([f['face_center'][0] for f in self.calibration_frames]),
+                    np.mean([f['face_center'][1] for f in self.calibration_frames])
+                )
+
+            self.is_calibrated = True
+            print("Calibration complete! Baseline position recorded.")
+
+    def _simulate_gaze_from_face(self, frame, faces, gray) -> Optional[dict]:
+        """
+        Simulate gaze data from face/eye detection for demo mode.
+
+        This improved version:
+        1. Detects eyes within face for better accuracy
+        2. Uses calibrated baseline for relative movement
+        3. Tracks both face position AND eye positions
+        4. More sensitive thresholds tuned for head movement
         """
         if len(faces) == 0:
+            self.debug_info['eyes_detected'] = False
             return None
 
         h, w = frame.shape[:2]
-        frame_center_x = w / 2
-        frame_center_y = h / 2
 
         # Use largest face
         face = max(faces, key=lambda f: f[2] * f[3])
-        x, y, fw, fh = face
-        face_center_x = x + fw / 2
-        face_center_y = y + fh / 2
+        fx, fy, fw, fh = face
+        face_center_x = fx + fw / 2
+        face_center_y = fy + fh / 2
 
-        # Calculate horizontal/vertical offset as proxy for gaze
-        # Normalize to approximately match OpenFace angle ranges
-        h_offset = (face_center_x - frame_center_x) / frame_center_x
-        v_offset = (frame_center_y - face_center_y) / frame_center_y
+        # Get eye positions
+        face_roi = gray[fy:fy+fh, fx:fx+fw]
+        left_eye, right_eye = self._detect_eyes_in_face(gray, face_roi, fx, fy)
+        self.debug_info['eyes_detected'] = left_eye is not None
 
-        # Add some noise and convert to approximate radians
-        gaze_x = h_offset * 0.4 + np.random.normal(0, 0.02)
-        gaze_y = v_offset * 0.3 + np.random.normal(0, 0.02)
+        # Calibrate if needed
+        if not self.is_calibrated:
+            self._calibrate(frame, face, gray)
+            # Return neutral during calibration
+            return {
+                'frame': self.frame_count,
+                'timestamp': time.time() - self.start_time if self.start_time else 0,
+                'gaze_0_x': 0, 'gaze_0_y': 0, 'gaze_0_z': 1,
+                'gaze_1_x': 0, 'gaze_1_y': 0, 'gaze_1_z': 1,
+                'gaze_angle_x': 0, 'gaze_angle_y': 0,
+                'pose_Rx': 0, 'pose_Ry': 0, 'pose_Rz': 0,
+                'AU04_r': 0, 'AU07_r': 0,
+                'confidence': 0.5, 'success': 1,
+            }
+
+        # Calculate offset from calibrated baseline
+        # Normalized to frame dimensions for consistent sensitivity
+        if self.baseline_face_center:
+            # Head position offset (primary signal in simulation mode)
+            h_offset = (face_center_x - self.baseline_face_center[0]) / (w * 0.15)
+            v_offset = (self.baseline_face_center[1] - face_center_y) / (h * 0.15)
+        else:
+            # Fallback to frame center
+            h_offset = (face_center_x - w/2) / (w * 0.2)
+            v_offset = (h/2 - face_center_y) / (h * 0.2)
+
+        # Clamp to reasonable range
+        h_offset = np.clip(h_offset, -1.5, 1.5)
+        v_offset = np.clip(v_offset, -1.0, 1.0)
+
+        # Eye-based refinement if eyes detected
+        eye_gaze_x = 0
+        eye_gaze_y = 0
+        if left_eye and right_eye and self.baseline_eye_positions:
+            # Calculate eye movement from baseline
+            eye_center_x = (left_eye[0] + right_eye[0]) / 2
+            eye_center_y = (left_eye[1] + right_eye[1]) / 2
+
+            baseline_eye_center_x = (
+                self.baseline_eye_positions['left'][0] +
+                self.baseline_eye_positions['right'][0]
+            ) / 2
+            baseline_eye_center_y = (
+                self.baseline_eye_positions['left'][1] +
+                self.baseline_eye_positions['right'][1]
+            ) / 2
+
+            eye_gaze_x = (eye_center_x - baseline_eye_center_x) / (fw * 0.3)
+            eye_gaze_y = (baseline_eye_center_y - eye_center_y) / (fh * 0.3)
+
+        # Combine head pose and eye position
+        # In simulation mode, head pose is primary, eyes are secondary
+        combined_gaze_x = h_offset * 0.7 + eye_gaze_x * 0.3
+        combined_gaze_y = v_offset * 0.7 + eye_gaze_y * 0.3
+
+        # Convert to approximate radians (scaled for sensitivity)
+        # These values are tuned to trigger the detection thresholds
+        gaze_x = combined_gaze_x * 0.35  # ~20 degrees at full offset
+        gaze_y = combined_gaze_y * 0.25  # ~14 degrees at full offset
+
+        # Head pose estimation from face position
+        head_yaw = h_offset * 0.3   # Head turn angle
+        head_pitch = -v_offset * 0.2  # Head tilt angle
+
+        # Add small noise for realism
+        gaze_x += np.random.normal(0, 0.01)
+        gaze_y += np.random.normal(0, 0.01)
+
+        # Update debug info
+        self.debug_info['gaze_x'] = gaze_x
+        self.debug_info['gaze_y'] = gaze_y
+        self.debug_info['head_yaw'] = head_yaw
+        self.debug_info['confidence'] = 0.8 if left_eye else 0.5
 
         return {
             'frame': self.frame_count,
@@ -1008,36 +1235,111 @@ class WebcamProcessor:
             'gaze_1_z': 0.95,
             'gaze_angle_x': gaze_x,
             'gaze_angle_y': gaze_y,
-            'pose_Rx': -v_offset * 0.2,
-            'pose_Ry': h_offset * 0.25,
+            'pose_Rx': head_pitch,
+            'pose_Ry': head_yaw,
             'pose_Rz': 0,
             'AU04_r': 0,
             'AU07_r': 0,
-            'confidence': 0.8,
+            'confidence': 0.8 if left_eye else 0.5,
             'success': 1,
         }
+
+    def _classify_realtime(self, frame_data: dict) -> GazeBehavior:
+        """
+        Classify behavior in real-time with adjusted thresholds for responsiveness.
+
+        This is a simplified version optimized for real-time feedback.
+        """
+        gaze_x = frame_data['gaze_angle_x']
+        gaze_y = frame_data['gaze_angle_y']
+        head_yaw = frame_data['pose_Ry']
+
+        # Store in history for variability calculation
+        self.gaze_history.append((gaze_x, gaze_y))
+        self.head_pose_history.append(head_yaw)
+
+        # Calculate gaze variability over recent history
+        variability = 0.0
+        if len(self.gaze_history) >= 10:
+            recent_x = [g[0] for g in list(self.gaze_history)[-15:]]
+            recent_y = [g[1] for g in list(self.gaze_history)[-15:]]
+            variability = np.sqrt(np.std(recent_x)**2 + np.std(recent_y)**2)
+
+        self.debug_info['variability'] = variability
+
+        # Thresholds (adjusted for better sensitivity)
+        # These are in radians: 0.15 rad ≈ 8.6°, 0.25 rad ≈ 14.3°
+        SIDE_GAZE_THRESHOLD = 0.12      # Looking to side
+        STRONG_SIDE_THRESHOLD = 0.20    # Strong side gaze
+        UP_GAZE_THRESHOLD = 0.10        # Looking up (thinking)
+        HEAD_TURN_THRESHOLD = 0.10      # Head turned
+        HIGH_VARIABILITY = 0.06         # Wandering gaze
+
+        abs_gaze_x = abs(gaze_x)
+        abs_head_yaw = abs(head_yaw)
+
+        # THINKING detection:
+        # - Looking UP (positive gaze_y) - classic recall behavior
+        # - OR high gaze variability (eyes wandering while processing)
+        if gaze_y > UP_GAZE_THRESHOLD:
+            return GazeBehavior.THINKING
+
+        if variability > HIGH_VARIABILITY and abs_gaze_x < SIDE_GAZE_THRESHOLD:
+            return GazeBehavior.THINKING
+
+        # CHEATING detection:
+        # - Strong sustained side gaze
+        # - Head turned in same direction as gaze
+        # - Low variability (stable reading position)
+        gaze_head_aligned = (gaze_x * head_yaw > 0)  # Same direction
+
+        if abs_gaze_x > STRONG_SIDE_THRESHOLD:
+            if gaze_head_aligned and abs_head_yaw > HEAD_TURN_THRESHOLD:
+                if variability < HIGH_VARIABILITY:
+                    return GazeBehavior.CHEATING
+            return GazeBehavior.SUSPICIOUS
+
+        # SUSPICIOUS detection:
+        # - Moderate side gaze
+        if abs_gaze_x > SIDE_GAZE_THRESHOLD:
+            if abs_head_yaw > HEAD_TURN_THRESHOLD * 0.5:
+                return GazeBehavior.SUSPICIOUS
+
+        # Default: NORMAL
+        return GazeBehavior.NORMAL
 
     def _process_frame(self, frame) -> GazeBehavior:
         """Process a single frame and return behavior classification."""
         frame_data = None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if self.use_simulation and self.face_cascade is not None:
-            # Simulation mode using face detection
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Simulation mode using face/eye detection
             faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
             )
-            frame_data = self._simulate_gaze_from_face(frame, faces)
+            frame_data = self._simulate_gaze_from_face(frame, faces, gray)
+
+            if frame_data and self.is_calibrated:
+                # Use our own real-time classifier for simulation mode
+                self.current_behavior = self._classify_realtime(frame_data)
         else:
             # Real OpenFace mode
             with self.data_lock:
                 if self.latest_openface_data:
                     frame_data = self.latest_openface_data.copy()
 
-        if frame_data:
-            behavior = self.detector.process_realtime_frame(frame_data)
-            if behavior:
-                self.current_behavior = behavior
+            if frame_data:
+                # Use the detector's processing for OpenFace data
+                behavior = self.detector.process_realtime_frame(frame_data)
+                if behavior:
+                    self.current_behavior = behavior
+
+                # Update debug info
+                self.debug_info['gaze_x'] = frame_data.get('gaze_angle_x', 0)
+                self.debug_info['gaze_y'] = frame_data.get('gaze_angle_y', 0)
+                self.debug_info['head_yaw'] = frame_data.get('pose_Ry', 0)
+                self.debug_info['confidence'] = frame_data.get('confidence', 0)
 
         return self.current_behavior
 
@@ -1069,6 +1371,94 @@ class WebcamProcessor:
             (75, bar_height // 2 + 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
         )
+
+        # Draw GAZE DEBUG panel on the LEFT
+        debug_panel_width = 200
+        debug_panel_x = 10
+        debug_panel_y = bar_height + 10
+
+        # Semi-transparent debug panel
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (debug_panel_x, debug_panel_y),
+            (debug_panel_x + debug_panel_width, debug_panel_y + 160),
+            (30, 30, 30), -1
+        )
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Debug panel title
+        cv2.putText(
+            frame, "Gaze Debug",
+            (debug_panel_x + 10, debug_panel_y + 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
+        )
+
+        # Gaze values with visual indicators
+        gaze_x = self.debug_info.get('gaze_x', 0)
+        gaze_y = self.debug_info.get('gaze_y', 0)
+        head_yaw = self.debug_info.get('head_yaw', 0)
+        variability = self.debug_info.get('variability', 0)
+        confidence = self.debug_info.get('confidence', 0)
+        eyes_detected = self.debug_info.get('eyes_detected', False)
+
+        # Convert to degrees for display
+        gaze_x_deg = np.degrees(gaze_x)
+        gaze_y_deg = np.degrees(gaze_y)
+        head_yaw_deg = np.degrees(head_yaw)
+
+        debug_lines = [
+            (f"Gaze X: {gaze_x_deg:+.1f} deg", self._get_gaze_color(abs(gaze_x), 0.12, 0.20)),
+            (f"Gaze Y: {gaze_y_deg:+.1f} deg", self._get_gaze_color(gaze_y, 0.10, 0.20) if gaze_y > 0 else (200, 200, 200)),
+            (f"Head Yaw: {head_yaw_deg:+.1f} deg", self._get_gaze_color(abs(head_yaw), 0.10, 0.15)),
+            (f"Variability: {variability:.3f}", (0, 255, 255) if variability > 0.06 else (200, 200, 200)),
+            (f"Confidence: {confidence:.1%}", (0, 255, 0) if confidence > 0.6 else (0, 165, 255)),
+            (f"Eyes: {'YES' if eyes_detected else 'NO'}", (0, 255, 0) if eyes_detected else (100, 100, 100)),
+        ]
+
+        for i, (text, text_color) in enumerate(debug_lines):
+            y_pos = debug_panel_y + 45 + i * 18
+            cv2.putText(
+                frame, text,
+                (debug_panel_x + 10, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1
+            )
+
+        # Draw gaze direction indicator (visual crosshair)
+        indicator_center_x = debug_panel_x + debug_panel_width // 2
+        indicator_center_y = debug_panel_y + 160 + 50
+        indicator_radius = 40
+
+        # Draw indicator background circle
+        cv2.circle(frame, (indicator_center_x, indicator_center_y), indicator_radius, (60, 60, 60), -1)
+        cv2.circle(frame, (indicator_center_x, indicator_center_y), indicator_radius, (100, 100, 100), 2)
+
+        # Draw crosshair
+        cv2.line(frame, (indicator_center_x - indicator_radius, indicator_center_y),
+                (indicator_center_x + indicator_radius, indicator_center_y), (80, 80, 80), 1)
+        cv2.line(frame, (indicator_center_x, indicator_center_y - indicator_radius),
+                (indicator_center_x, indicator_center_y + indicator_radius), (80, 80, 80), 1)
+
+        # Draw gaze point (clamped to circle)
+        gaze_point_x = int(indicator_center_x + np.clip(gaze_x * 150, -indicator_radius + 5, indicator_radius - 5))
+        gaze_point_y = int(indicator_center_y - np.clip(gaze_y * 150, -indicator_radius + 5, indicator_radius - 5))
+        cv2.circle(frame, (gaze_point_x, gaze_point_y), 8, color, -1)
+        cv2.circle(frame, (gaze_point_x, gaze_point_y), 8, (255, 255, 255), 2)
+
+        # Label for indicator
+        cv2.putText(
+            frame, "Gaze Direction",
+            (indicator_center_x - 45, indicator_center_y + indicator_radius + 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1
+        )
+
+        # Calibration status
+        if not self.is_calibrated:
+            cal_text = f"CALIBRATING... {len(self.calibration_frames)}/15"
+            cv2.putText(frame, cal_text, (w // 2 - 100, h // 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(frame, "Look at the camera", (w // 2 - 80, h // 2 + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         # Draw statistics panel on the right
         panel_width = 250
@@ -1153,9 +1543,9 @@ class WebcamProcessor:
 
         # Instructions
         cv2.putText(
-            frame, "Press 'q' to quit | 'r' to reset stats",
+            frame, "Press 'q' to quit | 'r' to reset stats | 'c' to recalibrate",
             (10, h - timeline_height - 20),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1
         )
 
         # Mode indicator
@@ -1168,6 +1558,15 @@ class WebcamProcessor:
         )
 
         return frame
+
+    def _get_gaze_color(self, value, threshold1, threshold2):
+        """Return color based on gaze value thresholds."""
+        if abs(value) > threshold2:
+            return (0, 0, 255)  # Red - high
+        elif abs(value) > threshold1:
+            return (0, 165, 255)  # Orange - medium
+        else:
+            return (0, 255, 0)  # Green - normal
 
     def _update_stats(self):
         """Update behavior time statistics."""
@@ -1238,6 +1637,14 @@ class WebcamProcessor:
                     self.start_time = time.time()
                     self.last_behavior_time = self.start_time
                     print("Statistics reset")
+                elif key == ord('c'):
+                    # Recalibrate
+                    self.is_calibrated = False
+                    self.calibration_frames = []
+                    self.baseline_face_center = None
+                    self.baseline_eye_positions = None
+                    self.gaze_history.clear()
+                    print("Recalibrating... Look at the camera")
 
         except KeyboardInterrupt:
             print("\nInterrupted by user")
