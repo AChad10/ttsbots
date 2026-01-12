@@ -22,6 +22,8 @@ transformers>=4.40.0
 sentencepiece
 
 # For Chatterbox
+# NOTE: On Python 3.12+, install with: pip install chatterbox-tts --no-build-isolation
+# This avoids the package's outdated setuptools pinning in its build requirements
 chatterbox-tts
 
 # For MeloTTS - Install from source
