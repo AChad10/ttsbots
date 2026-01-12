@@ -21,7 +21,8 @@ Known Issues:
 import os
 import time
 import torch
-import torchaudio
+import soundfile as sf
+import numpy as np
 from transformers import AutoProcessor, SeamlessM4Tv2Model
 
 # Test phrases for hiring agent
@@ -132,15 +133,15 @@ class SeamlessTTS:
 
     def save_audio(self, audio, sample_rate: int, filepath: str):
         """Save audio to WAV file."""
-        # Convert to tensor for torchaudio
-        if not isinstance(audio, torch.Tensor):
-            audio = torch.from_numpy(audio)
+        # Convert to numpy array if tensor
+        if isinstance(audio, torch.Tensor):
+            audio = audio.cpu().numpy()
 
-        # Ensure correct shape (channels, samples)
-        if audio.dim() == 1:
-            audio = audio.unsqueeze(0)
+        # Ensure correct shape for soundfile (samples,) or (samples, channels)
+        if audio.ndim == 2 and audio.shape[0] < audio.shape[1]:
+            audio = audio.T  # Transpose from (channels, samples) to (samples, channels)
 
-        torchaudio.save(filepath, audio, sample_rate)
+        sf.write(filepath, audio, sample_rate)
         print(f"Saved: {filepath}")
 
 
