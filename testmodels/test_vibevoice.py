@@ -240,7 +240,8 @@ class VibeVoiceRealtimeTTS:
             # Load voice preset
             print(f"Loading voice preset for {speaker_name}...")
             preset_path = _find_voice_preset_path(speaker_name)
-            self.voice_preset = torch.load(preset_path, map_location=self.device)
+            # PyTorch 2.6+ requires weights_only=False for trusted checkpoints
+            self.voice_preset = torch.load(preset_path, map_location=self.device, weights_only=False)
 
             print("Model loaded successfully!")
 
