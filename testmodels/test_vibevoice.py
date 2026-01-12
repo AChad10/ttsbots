@@ -102,9 +102,10 @@ def _find_voice_preset_path(speaker_name: str = "Carter") -> str:
     Find the voice preset file for the given speaker.
 
     Searches multiple possible locations:
-    1. demo/voices/streaming_model/ in sys.path
-    2. Relative to current directory
-    3. Common installation paths
+    1. VibeVoice directory in project root
+    2. demo/voices/streaming_model/ in sys.path
+    3. Relative to current directory
+    4. Common installation paths
 
     Returns:
         Path to the voice preset .pt file
@@ -112,18 +113,28 @@ def _find_voice_preset_path(speaker_name: str = "Carter") -> str:
     Raises:
         FileNotFoundError: If preset file not found
     """
-    preset_filename = f"en-{speaker_name}.pt"
+    preset_filename = f"en-{speaker_name}_man.pt"
 
     # Search paths
     search_paths = []
 
-    # 1. Search in sys.path for demo/voices/streaming_model
+    # 1. Search in project's VibeVoice directory first (most likely location)
+    project_root = Path(__file__).parent.parent  # Go up from testmodels to ttsbots
+    vibevoice_path = project_root / "VibeVoice" / "demo" / "voices" / "streaming_model" / preset_filename
+    search_paths.append(vibevoice_path)
+
+    # Also check in checkpoint directory
+    checkpoint_path = project_root / "VibeVoice" / "checkpoints" / "0.5B" / "voices" / preset_filename
+    search_paths.append(checkpoint_path)
+
+    # 2. Search in sys.path for demo/voices/streaming_model
     for path in sys.path:
         candidate = Path(path) / "demo" / "voices" / "streaming_model" / preset_filename
         search_paths.append(candidate)
 
-    # 2. Relative to current directory
+    # 3. Relative to current directory
     search_paths.extend([
+        Path.cwd() / "VibeVoice" / "demo" / "voices" / "streaming_model" / preset_filename,
         Path.cwd() / "demo" / "voices" / "streaming_model" / preset_filename,
         Path.cwd() / "voices" / "streaming_model" / preset_filename,
         Path.cwd() / preset_filename,
