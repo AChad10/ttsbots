@@ -196,18 +196,45 @@ class OpenFaceCheatingDetector:
 
     def _find_openface(self) -> Optional[str]:
         """Locate OpenFace FeatureExtraction binary."""
+        # Get the directory where the script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cwd = os.getcwd()
+
         possible_paths = [
+            # Local project paths (check these first)
+            os.path.join(cwd, "OpenFace", "build", "bin", "FeatureExtraction"),
+            os.path.join(cwd, "OpenFace", "FeatureExtraction"),
+            os.path.join(cwd, "OpenFace", "x64", "Release", "FeatureExtraction.exe"),
+            os.path.join(script_dir, "OpenFace", "build", "bin", "FeatureExtraction"),
+            os.path.join(script_dir, "OpenFace", "FeatureExtraction"),
+            os.path.join(cwd, "..", "OpenFace", "build", "bin", "FeatureExtraction"),
+            # System paths
             "/usr/local/bin/FeatureExtraction",
             "/opt/OpenFace/build/bin/FeatureExtraction",
             "~/OpenFace/build/bin/FeatureExtraction",
+            # Windows paths
             "C:/OpenFace/FeatureExtraction.exe",
-            "FeatureExtraction",  # If in PATH
+            "C:/OpenFace/build/bin/Release/FeatureExtraction.exe",
+            # In PATH
+            "FeatureExtraction",
         ]
 
         for path in possible_paths:
             expanded = os.path.expanduser(path)
             if os.path.exists(expanded):
                 return expanded
+
+        # Search recursively in OpenFace directory if it exists
+        openface_dirs = [
+            os.path.join(cwd, "OpenFace"),
+            os.path.join(script_dir, "OpenFace"),
+        ]
+        for of_dir in openface_dirs:
+            if os.path.isdir(of_dir):
+                for binary_name in ["FeatureExtraction", "FeatureExtraction.exe"]:
+                    for root, dirs, files in os.walk(of_dir):
+                        if binary_name in files:
+                            return os.path.join(root, binary_name)
 
         return None
 
@@ -870,21 +897,63 @@ class WebcamProcessor:
 
     def _find_openface_live(self) -> Optional[str]:
         """Find OpenFace binary for live video processing."""
+        # Get the directory where the script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cwd = os.getcwd()
+
         possible_paths = [
+            # Local project paths (most common for users)
+            os.path.join(cwd, "OpenFace", "build", "bin", "FaceLandmarkVid"),
+            os.path.join(cwd, "OpenFace", "build", "bin", "FeatureExtraction"),
+            os.path.join(cwd, "OpenFace", "FaceLandmarkVid"),
+            os.path.join(cwd, "OpenFace", "FeatureExtraction"),
+            os.path.join(cwd, "OpenFace", "x64", "Release", "FaceLandmarkVid.exe"),
+            os.path.join(cwd, "OpenFace", "x64", "Release", "FeatureExtraction.exe"),
+            # Script directory paths
+            os.path.join(script_dir, "OpenFace", "build", "bin", "FaceLandmarkVid"),
+            os.path.join(script_dir, "OpenFace", "build", "bin", "FeatureExtraction"),
+            os.path.join(script_dir, "OpenFace", "FaceLandmarkVid"),
+            os.path.join(script_dir, "OpenFace", "FeatureExtraction"),
+            # Parent directory
+            os.path.join(cwd, "..", "OpenFace", "build", "bin", "FaceLandmarkVid"),
+            os.path.join(cwd, "..", "OpenFace", "build", "bin", "FeatureExtraction"),
+            # System paths
             "/usr/local/bin/FaceLandmarkVid",
-            "/opt/OpenFace/build/bin/FaceLandmarkVid",
-            "~/OpenFace/build/bin/FaceLandmarkVid",
-            "C:/OpenFace/FaceLandmarkVid.exe",
-            "FaceLandmarkVid",
-            # Also try FeatureExtraction as fallback
             "/usr/local/bin/FeatureExtraction",
+            "/opt/OpenFace/build/bin/FaceLandmarkVid",
             "/opt/OpenFace/build/bin/FeatureExtraction",
+            "~/OpenFace/build/bin/FaceLandmarkVid",
+            "~/OpenFace/build/bin/FeatureExtraction",
+            # Windows paths
+            "C:/OpenFace/FaceLandmarkVid.exe",
+            "C:/OpenFace/FeatureExtraction.exe",
+            "C:/OpenFace/build/bin/Release/FaceLandmarkVid.exe",
+            "C:/OpenFace/build/bin/Release/FeatureExtraction.exe",
+            # In PATH
+            "FaceLandmarkVid",
+            "FeatureExtraction",
         ]
 
         for path in possible_paths:
             expanded = os.path.expanduser(path)
             if os.path.exists(expanded):
+                print(f"Found OpenFace at: {expanded}")
                 return expanded
+
+        # Also search recursively in OpenFace directory if it exists
+        openface_dirs = [
+            os.path.join(cwd, "OpenFace"),
+            os.path.join(script_dir, "OpenFace"),
+        ]
+        for of_dir in openface_dirs:
+            if os.path.isdir(of_dir):
+                for binary_name in ["FaceLandmarkVid", "FeatureExtraction",
+                                   "FaceLandmarkVid.exe", "FeatureExtraction.exe"]:
+                    for root, dirs, files in os.walk(of_dir):
+                        if binary_name in files:
+                            found_path = os.path.join(root, binary_name)
+                            print(f"Found OpenFace at: {found_path}")
+                            return found_path
 
         return None
 
