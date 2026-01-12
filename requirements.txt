@@ -34,3 +34,4 @@ safetensors
 
 # For OpenFace cheating detection
 pandas>=1.3.0
+opencv-python>=4.5.0  # For webcam mode

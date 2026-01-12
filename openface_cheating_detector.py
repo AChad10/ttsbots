@@ -13,6 +13,7 @@ Requirements:
     - OpenFace 2.0+ installed (https://github.com/TadasBaltrusaitis/OpenFace)
     - Python 3.8+
     - numpy, pandas, scipy
+    - opencv-python (for webcam mode)
 
 Usage:
     # Process a video file
@@ -23,6 +24,9 @@ Usage:
 
     # Real-time webcam analysis
     python openface_cheating_detector.py --webcam
+
+    # Webcam with specific device
+    python openface_cheating_detector.py --webcam --camera-id 1
 """
 
 import numpy as np
@@ -36,7 +40,18 @@ import tempfile
 import os
 import argparse
 import json
+import time
+import threading
+import signal
+import sys
 from pathlib import Path
+
+# Optional imports for webcam mode
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
 
 
 class GazeBehavior(Enum):
@@ -720,6 +735,560 @@ class OpenFaceCheatingDetector:
 
         return self.current_behavior
 
+    def run_webcam_demo(self, camera_id: int = 0, show_visualization: bool = True):
+        """
+        Run live webcam cheating detection demo.
+
+        Args:
+            camera_id: Camera device ID (default 0)
+            show_visualization: Whether to show OpenCV visualization
+        """
+        if not CV2_AVAILABLE:
+            raise RuntimeError(
+                "OpenCV not installed. Install with: pip install opencv-python"
+            )
+
+        processor = WebcamProcessor(self, camera_id, show_visualization)
+        processor.run()
+
+
+class WebcamProcessor:
+    """
+    Real-time webcam processor for cheating detection.
+
+    Supports two modes:
+    1. With OpenFace binary: Full gaze tracking via OpenFace subprocess
+    2. Simulation mode: Uses face detection for demo when OpenFace unavailable
+    """
+
+    # Colors for visualization (BGR format)
+    COLORS = {
+        GazeBehavior.NORMAL: (0, 255, 0),      # Green
+        GazeBehavior.THINKING: (255, 191, 0),  # Deep sky blue
+        GazeBehavior.SUSPICIOUS: (0, 165, 255),  # Orange
+        GazeBehavior.CHEATING: (0, 0, 255),    # Red
+    }
+
+    STATUS_TEXT = {
+        GazeBehavior.NORMAL: "NORMAL - Looking at screen",
+        GazeBehavior.THINKING: "THINKING - Processing/recalling",
+        GazeBehavior.SUSPICIOUS: "SUSPICIOUS - Extended side gaze",
+        GazeBehavior.CHEATING: "CHEATING - Looking at other screen",
+    }
+
+    def __init__(
+        self,
+        detector: OpenFaceCheatingDetector,
+        camera_id: int = 0,
+        show_visualization: bool = True
+    ):
+        self.detector = detector
+        self.camera_id = camera_id
+        self.show_visualization = show_visualization
+
+        self.running = False
+        self.current_behavior = GazeBehavior.NORMAL
+        self.behavior_history = deque(maxlen=150)  # 5 seconds at 30fps
+        self.frame_count = 0
+        self.start_time = None
+
+        # Statistics tracking
+        self.behavior_times = {
+            GazeBehavior.NORMAL: 0.0,
+            GazeBehavior.THINKING: 0.0,
+            GazeBehavior.SUSPICIOUS: 0.0,
+            GazeBehavior.CHEATING: 0.0,
+        }
+        self.last_behavior_time = None
+
+        # OpenFace process
+        self.openface_process = None
+        self.openface_thread = None
+        self.latest_openface_data = None
+        self.data_lock = threading.Lock()
+
+        # Face detection fallback (when OpenFace unavailable)
+        self.face_cascade = None
+        self.use_simulation = False
+
+    def _find_openface_live(self) -> Optional[str]:
+        """Find OpenFace binary for live video processing."""
+        possible_paths = [
+            "/usr/local/bin/FaceLandmarkVid",
+            "/opt/OpenFace/build/bin/FaceLandmarkVid",
+            "~/OpenFace/build/bin/FaceLandmarkVid",
+            "C:/OpenFace/FaceLandmarkVid.exe",
+            "FaceLandmarkVid",
+            # Also try FeatureExtraction as fallback
+            "/usr/local/bin/FeatureExtraction",
+            "/opt/OpenFace/build/bin/FeatureExtraction",
+        ]
+
+        for path in possible_paths:
+            expanded = os.path.expanduser(path)
+            if os.path.exists(expanded):
+                return expanded
+
+        return None
+
+    def _start_openface(self):
+        """Start OpenFace subprocess for real-time processing."""
+        openface_path = self._find_openface_live()
+
+        if not openface_path:
+            print("OpenFace not found - running in simulation mode")
+            print("For full gaze tracking, install OpenFace from:")
+            print("https://github.com/TadasBaltrusaitis/OpenFace")
+            self.use_simulation = True
+            self._init_face_cascade()
+            return
+
+        output_dir = tempfile.mkdtemp(prefix="openface_live_")
+
+        # Use device camera
+        cmd = [
+            openface_path,
+            "-device", str(self.camera_id),
+            "-out_dir", output_dir,
+            "-pose",
+            "-gaze",
+            "-aus",
+        ]
+
+        print(f"Starting OpenFace: {' '.join(cmd)}")
+
+        try:
+            self.openface_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+
+            # Start thread to read OpenFace output
+            self.openface_thread = threading.Thread(
+                target=self._read_openface_output,
+                args=(output_dir,),
+                daemon=True
+            )
+            self.openface_thread.start()
+
+        except Exception as e:
+            print(f"Failed to start OpenFace: {e}")
+            print("Running in simulation mode")
+            self.use_simulation = True
+            self._init_face_cascade()
+
+    def _init_face_cascade(self):
+        """Initialize OpenCV face cascade for simulation mode."""
+        cascade_paths = [
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
+            '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
+        ]
+
+        for path in cascade_paths:
+            if os.path.exists(path):
+                self.face_cascade = cv2.CascadeClassifier(path)
+                break
+
+    def _read_openface_output(self, output_dir: str):
+        """Read OpenFace CSV output in real-time."""
+        csv_pattern = os.path.join(output_dir, "*.csv")
+        csv_file = None
+
+        # Wait for CSV file to be created
+        for _ in range(50):  # 5 seconds timeout
+            import glob
+            files = glob.glob(csv_pattern)
+            if files:
+                csv_file = files[0]
+                break
+            time.sleep(0.1)
+
+        if not csv_file:
+            print("Warning: OpenFace CSV output not found")
+            return
+
+        # Tail the CSV file
+        last_pos = 0
+        header = None
+
+        while self.running:
+            try:
+                with open(csv_file, 'r') as f:
+                    f.seek(last_pos)
+                    lines = f.readlines()
+                    last_pos = f.tell()
+
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    if header is None:
+                        header = [h.strip() for h in line.split(',')]
+                        continue
+
+                    values = line.split(',')
+                    if len(values) != len(header):
+                        continue
+
+                    data = dict(zip(header, values))
+
+                    try:
+                        frame_data = {
+                            'frame': int(float(data.get('frame', 0))),
+                            'timestamp': float(data.get('timestamp', 0)),
+                            'gaze_0_x': float(data.get('gaze_0_x', 0)),
+                            'gaze_0_y': float(data.get('gaze_0_y', 0)),
+                            'gaze_0_z': float(data.get('gaze_0_z', 1)),
+                            'gaze_1_x': float(data.get('gaze_1_x', 0)),
+                            'gaze_1_y': float(data.get('gaze_1_y', 0)),
+                            'gaze_1_z': float(data.get('gaze_1_z', 1)),
+                            'gaze_angle_x': float(data.get('gaze_angle_x', 0)),
+                            'gaze_angle_y': float(data.get('gaze_angle_y', 0)),
+                            'pose_Rx': float(data.get('pose_Rx', 0)),
+                            'pose_Ry': float(data.get('pose_Ry', 0)),
+                            'pose_Rz': float(data.get('pose_Rz', 0)),
+                            'AU04_r': float(data.get('AU04_r', 0)),
+                            'AU07_r': float(data.get('AU07_r', 0)),
+                            'confidence': float(data.get('confidence', 1)),
+                            'success': int(float(data.get('success', 1))),
+                        }
+
+                        with self.data_lock:
+                            self.latest_openface_data = frame_data
+
+                    except (ValueError, KeyError) as e:
+                        continue
+
+                time.sleep(0.01)  # Small delay
+
+            except Exception as e:
+                time.sleep(0.1)
+
+    def _simulate_gaze_from_face(self, frame, faces) -> Optional[dict]:
+        """
+        Simulate gaze data from face detection for demo mode.
+
+        Uses face position relative to frame center as a proxy for gaze.
+        """
+        if len(faces) == 0:
+            return None
+
+        h, w = frame.shape[:2]
+        frame_center_x = w / 2
+        frame_center_y = h / 2
+
+        # Use largest face
+        face = max(faces, key=lambda f: f[2] * f[3])
+        x, y, fw, fh = face
+        face_center_x = x + fw / 2
+        face_center_y = y + fh / 2
+
+        # Calculate horizontal/vertical offset as proxy for gaze
+        # Normalize to approximately match OpenFace angle ranges
+        h_offset = (face_center_x - frame_center_x) / frame_center_x
+        v_offset = (frame_center_y - face_center_y) / frame_center_y
+
+        # Add some noise and convert to approximate radians
+        gaze_x = h_offset * 0.4 + np.random.normal(0, 0.02)
+        gaze_y = v_offset * 0.3 + np.random.normal(0, 0.02)
+
+        return {
+            'frame': self.frame_count,
+            'timestamp': time.time() - self.start_time if self.start_time else 0,
+            'gaze_0_x': gaze_x,
+            'gaze_0_y': gaze_y,
+            'gaze_0_z': 0.95,
+            'gaze_1_x': gaze_x,
+            'gaze_1_y': gaze_y,
+            'gaze_1_z': 0.95,
+            'gaze_angle_x': gaze_x,
+            'gaze_angle_y': gaze_y,
+            'pose_Rx': -v_offset * 0.2,
+            'pose_Ry': h_offset * 0.25,
+            'pose_Rz': 0,
+            'AU04_r': 0,
+            'AU07_r': 0,
+            'confidence': 0.8,
+            'success': 1,
+        }
+
+    def _process_frame(self, frame) -> GazeBehavior:
+        """Process a single frame and return behavior classification."""
+        frame_data = None
+
+        if self.use_simulation and self.face_cascade is not None:
+            # Simulation mode using face detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+            )
+            frame_data = self._simulate_gaze_from_face(frame, faces)
+        else:
+            # Real OpenFace mode
+            with self.data_lock:
+                if self.latest_openface_data:
+                    frame_data = self.latest_openface_data.copy()
+
+        if frame_data:
+            behavior = self.detector.process_realtime_frame(frame_data)
+            if behavior:
+                self.current_behavior = behavior
+
+        return self.current_behavior
+
+    def _draw_overlay(self, frame):
+        """Draw status overlay on frame."""
+        h, w = frame.shape[:2]
+        behavior = self.current_behavior
+        color = self.COLORS[behavior]
+        status_text = self.STATUS_TEXT[behavior]
+
+        # Draw colored border based on status
+        border_thickness = 8
+        cv2.rectangle(frame, (0, 0), (w, h), color, border_thickness)
+
+        # Draw status bar at top
+        bar_height = 80
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, bar_height), (40, 40, 40), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Draw status indicator circle
+        indicator_radius = 20
+        cv2.circle(frame, (40, bar_height // 2), indicator_radius, color, -1)
+        cv2.circle(frame, (40, bar_height // 2), indicator_radius, (255, 255, 255), 2)
+
+        # Draw status text
+        cv2.putText(
+            frame, status_text,
+            (75, bar_height // 2 + 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+        )
+
+        # Draw statistics panel on the right
+        panel_width = 250
+        panel_x = w - panel_width - 10
+        panel_y = bar_height + 10
+
+        # Semi-transparent panel
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (panel_x, panel_y),
+            (w - 10, panel_y + 180),
+            (30, 30, 30), -1
+        )
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        # Panel title
+        cv2.putText(
+            frame, "Session Stats",
+            (panel_x + 10, panel_y + 25),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1
+        )
+
+        # Calculate elapsed time
+        elapsed = time.time() - self.start_time if self.start_time else 0
+
+        # Stats text
+        stats = [
+            f"Time: {elapsed:.0f}s",
+            f"Frames: {self.frame_count}",
+            "",
+            f"Normal: {self.behavior_times[GazeBehavior.NORMAL]:.1f}s",
+            f"Thinking: {self.behavior_times[GazeBehavior.THINKING]:.1f}s",
+            f"Suspicious: {self.behavior_times[GazeBehavior.SUSPICIOUS]:.1f}s",
+            f"Cheating: {self.behavior_times[GazeBehavior.CHEATING]:.1f}s",
+        ]
+
+        for i, text in enumerate(stats):
+            y_pos = panel_y + 50 + i * 18
+            text_color = (200, 200, 200)
+
+            # Color-code the behavior lines
+            if "Normal:" in text:
+                text_color = self.COLORS[GazeBehavior.NORMAL]
+            elif "Thinking:" in text:
+                text_color = self.COLORS[GazeBehavior.THINKING]
+            elif "Suspicious:" in text:
+                text_color = self.COLORS[GazeBehavior.SUSPICIOUS]
+            elif "Cheating:" in text:
+                text_color = self.COLORS[GazeBehavior.CHEATING]
+
+            cv2.putText(
+                frame, text,
+                (panel_x + 15, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1
+            )
+
+        # Draw behavior timeline at bottom
+        timeline_height = 30
+        timeline_y = h - timeline_height - 10
+
+        # Timeline background
+        cv2.rectangle(
+            frame,
+            (10, timeline_y),
+            (w - 10, timeline_y + timeline_height),
+            (40, 40, 40), -1
+        )
+
+        # Draw recent behavior history as colored segments
+        if self.behavior_history:
+            segment_width = (w - 20) / len(self.behavior_history)
+            for i, b in enumerate(self.behavior_history):
+                x1 = int(10 + i * segment_width)
+                x2 = int(10 + (i + 1) * segment_width)
+                cv2.rectangle(
+                    frame,
+                    (x1, timeline_y + 2),
+                    (x2, timeline_y + timeline_height - 2),
+                    self.COLORS[b], -1
+                )
+
+        # Instructions
+        cv2.putText(
+            frame, "Press 'q' to quit | 'r' to reset stats",
+            (10, h - timeline_height - 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1
+        )
+
+        # Mode indicator
+        mode_text = "SIMULATION MODE" if self.use_simulation else "OPENFACE MODE"
+        mode_color = (0, 165, 255) if self.use_simulation else (0, 255, 0)
+        cv2.putText(
+            frame, mode_text,
+            (w - 180, bar_height // 2 + 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 1
+        )
+
+        return frame
+
+    def _update_stats(self):
+        """Update behavior time statistics."""
+        current_time = time.time()
+
+        if self.last_behavior_time is not None:
+            elapsed = current_time - self.last_behavior_time
+            self.behavior_times[self.current_behavior] += elapsed
+
+        self.last_behavior_time = current_time
+        self.behavior_history.append(self.current_behavior)
+
+    def run(self):
+        """Run the webcam processing loop."""
+        print(f"\nStarting webcam cheating detection (camera {self.camera_id})...")
+        print("=" * 50)
+
+        # Open camera
+        cap = cv2.VideoCapture(self.camera_id)
+
+        if not cap.isOpened():
+            print(f"Error: Could not open camera {self.camera_id}")
+            return
+
+        # Set camera properties
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        self.running = True
+        self.start_time = time.time()
+        self.last_behavior_time = self.start_time
+
+        # Start OpenFace (or simulation mode)
+        self._start_openface()
+
+        print("\nWebcam opened successfully!")
+        print("Press 'q' to quit, 'r' to reset statistics")
+        print("=" * 50 + "\n")
+
+        try:
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Could not read frame")
+                    break
+
+                self.frame_count += 1
+
+                # Process frame
+                self._process_frame(frame)
+                self._update_stats()
+
+                # Draw visualization
+                if self.show_visualization:
+                    frame = self._draw_overlay(frame)
+                    cv2.imshow('Cheating Detection - Live', frame)
+
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("\nQuitting...")
+                    break
+                elif key == ord('r'):
+                    # Reset statistics
+                    self.behavior_times = {b: 0.0 for b in GazeBehavior}
+                    self.behavior_history.clear()
+                    self.start_time = time.time()
+                    self.last_behavior_time = self.start_time
+                    print("Statistics reset")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+
+        finally:
+            self.running = False
+
+            # Cleanup
+            if self.openface_process:
+                self.openface_process.terminate()
+                self.openface_process.wait()
+
+            cap.release()
+            cv2.destroyAllWindows()
+
+            # Print final statistics
+            self._print_final_stats()
+
+    def _print_final_stats(self):
+        """Print final session statistics."""
+        total_time = sum(self.behavior_times.values())
+
+        print("\n" + "=" * 50)
+        print("SESSION COMPLETE")
+        print("=" * 50)
+        print(f"\nTotal Duration: {total_time:.1f} seconds")
+        print(f"Total Frames: {self.frame_count}")
+        print("\nBehavior Breakdown:")
+
+        for behavior, time_spent in self.behavior_times.items():
+            pct = (time_spent / total_time * 100) if total_time > 0 else 0
+            print(f"  {behavior.value:12s}: {time_spent:6.1f}s ({pct:5.1f}%)")
+
+        # Calculate risk score
+        cheating_pct = self.behavior_times[GazeBehavior.CHEATING] / max(total_time, 1)
+        suspicious_pct = self.behavior_times[GazeBehavior.SUSPICIOUS] / max(total_time, 1)
+        risk_score = min(1.0, cheating_pct * 2 + suspicious_pct * 0.5)
+
+        print(f"\nOverall Risk Score: {risk_score:.2f} / 1.00")
+
+        if risk_score < 0.2:
+            print("Assessment: LOW RISK - Normal behavior observed")
+        elif risk_score < 0.4:
+            print("Assessment: MINIMAL RISK - Some suspicious moments")
+        elif risk_score < 0.6:
+            print("Assessment: MODERATE RISK - Review recommended")
+        else:
+            print("Assessment: HIGH RISK - Significant cheating indicators")
+
+        print("=" * 50)
+
 
 def format_report(report: CheatingReport) -> str:
     """Format a CheatingReport as a readable string."""
@@ -777,6 +1346,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  Live webcam analysis:
+    python openface_cheating_detector.py --webcam
+
+  Webcam with specific camera:
+    python openface_cheating_detector.py --webcam --camera-id 1
+
   Analyze a video file:
     python openface_cheating_detector.py --video interview.mp4
 
@@ -792,11 +1367,15 @@ Examples:
     )
 
     input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--webcam', action='store_true',
+                            help='Run live webcam cheating detection')
     input_group.add_argument('--video', type=str, help='Path to video file')
     input_group.add_argument('--csv', type=str, help='Path to OpenFace CSV output')
     input_group.add_argument('--demo', action='store_true',
                             help='Run demo with synthetic data')
 
+    parser.add_argument('--camera-id', type=int, default=0,
+                       help='Camera device ID for webcam mode (default: 0)')
     parser.add_argument('--threshold', type=float, default=0.25,
                        help='Horizontal gaze threshold in radians (default: 0.25)')
     parser.add_argument('--duration', type=float, default=2.0,
@@ -807,6 +1386,8 @@ Examples:
                        help='Output results as JSON')
     parser.add_argument('--output', type=str,
                        help='Save report to file')
+    parser.add_argument('--no-display', action='store_true',
+                       help='Disable visualization window (webcam mode)')
 
     args = parser.parse_args()
 
@@ -815,6 +1396,18 @@ Examples:
         sustained_duration=args.duration,
         openface_path=args.openface_path
     )
+
+    # Webcam mode - live analysis
+    if args.webcam:
+        if not CV2_AVAILABLE:
+            print("Error: OpenCV not installed. Install with: pip install opencv-python")
+            sys.exit(1)
+
+        detector.run_webcam_demo(
+            camera_id=args.camera_id,
+            show_visualization=not args.no_display
+        )
+        return  # Webcam mode handles its own output
 
     if args.demo:
         # Generate synthetic demo data
