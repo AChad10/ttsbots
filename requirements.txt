@@ -2,8 +2,9 @@
 #   python -m pip install --upgrade pip setuptools wheel
 #
 # Build system dependencies (install these first if you get setuptools errors)
+# NOTE: Python 3.12+ requires setuptools>=67.8.0 due to removal of pkgutil.ImpImporter
 pip>=23.0
-setuptools>=61.0
+setuptools>=67.8.0
 wheel
 
 # Core dependencies for TTS model comparison
