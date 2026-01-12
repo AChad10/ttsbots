@@ -1,3 +1,11 @@
+# IMPORTANT: Before installing, upgrade pip and setuptools:
+#   python -m pip install --upgrade pip setuptools wheel
+#
+# Build system dependencies (install these first if you get setuptools errors)
+pip>=23.0
+setuptools>=61.0
+wheel
+
 # Core dependencies for TTS model comparison
 torch>=2.1.0
 torchaudio>=2.1.0
