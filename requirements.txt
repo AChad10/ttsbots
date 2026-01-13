@@ -1,3 +1,12 @@
+# IMPORTANT: Before installing, upgrade pip and setuptools:
+#   python -m pip install --upgrade pip setuptools wheel
+#
+# Build system dependencies (install these first if you get setuptools errors)
+# NOTE: Python 3.12+ requires setuptools>=67.8.0 due to removal of pkgutil.ImpImporter
+pip>=23.0
+setuptools>=67.8.0
+wheel
+
 # Core dependencies for TTS model comparison
 torch>=2.1.0
 torchaudio>=2.1.0
@@ -13,6 +22,12 @@ transformers>=4.40.0
 sentencepiece
 
 # For Chatterbox
+# NOTE: chatterbox-tts pins numpy<1.26.0 which doesn't support Python 3.12
+# RECOMMENDED: Use Python 3.11 for best compatibility
+# WORKAROUND for Python 3.12+:
+#   pip install numpy>=1.26.0
+#   pip install chatterbox-tts --no-deps
+#   pip install -r requirements.txt
 chatterbox-tts
 
 # For MeloTTS - Install from source
